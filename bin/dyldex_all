@@ -13,7 +13,7 @@ import progressbar
 try:
 	import resource
 	soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-	resource.setrlimit(resource.RLIMIT_NOFILE, (1024, hard))
+	resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
 except ImportError:
 	# resource module is not available on windows
 	pass
