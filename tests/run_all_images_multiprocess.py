@@ -55,6 +55,7 @@ def _imageRunner(dyldPath: str, imageIndex: int) -> None:
 	logger.setLevel(level)
 
 	# process the image
+	machoCtx = None
 	with open(dyldPath, "rb") as f:
 		dyldCtx = DyldContext(f)
 
@@ -98,6 +99,8 @@ def _imageRunner(dyldPath: str, imageIndex: int) -> None:
 			pass
 
 		finally:
+			if machoCtx is not None:
+				machoCtx.close()
 			for file in subCacheFiles:
 				file.close()
 				pass

@@ -118,6 +118,7 @@ def _extractImage(
 	)
 
 	subCacheFiles: List[BinaryIO] = []
+	machoCtx = None
 	try:
 		# add sub caches if there are any
 		subCacheFiles = dyldCtx.addSubCaches(dyldFilePath)
@@ -162,6 +163,8 @@ def _extractImage(
 		statusBar.update(unit="Extractor", status="Done")
 
 	finally:
+		if machoCtx is not None:
+			machoCtx.close()
 		for file in subCacheFiles:
 			file.close()
 			pass

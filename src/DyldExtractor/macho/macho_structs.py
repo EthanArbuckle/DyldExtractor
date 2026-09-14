@@ -94,6 +94,7 @@ class LoadCommands(IntEnum):
 	LC_FUNCTION_VARIANTS = 0x37
 	LC_FUNCTION_VARIANT_FIXUPS = 0x38
 	LC_TARGET_TRIPLE = 0x39
+	LC_LAZY_LOAD_DYLIB_INFO = 0x3A
 
 
 class mach_header_64(Structure):
@@ -522,6 +523,16 @@ class rpath_command(Structure):
 		("path", lc_str),
 	]
 
+class target_triple_command(Structure):
+	cmd: int
+	cmdsize: int
+	triple: lc_str
+
+	_fields_ = [
+		("cmd", c_uint32),
+		("cmdsize", c_uint32),
+		("triple", lc_str),
+	]
 
 class linkedit_data_command(Structure):
 	cmd: int 		# LC_CODE_SIGNATURE, LC_SEGMENT_SPLIT_INFO,
@@ -790,7 +801,8 @@ LoadCommandMap = {
 	LoadCommands.LC_ATOM_INFO: linkedit_data_command,
 	LoadCommands.LC_FUNCTION_VARIANTS: linkedit_data_command,
 	LoadCommands.LC_FUNCTION_VARIANT_FIXUPS: linkedit_data_command,
-	LoadCommands.LC_TARGET_TRIPLE: linkedit_data_command,
+	LoadCommands.LC_TARGET_TRIPLE: target_triple_command,
+	LoadCommands.LC_LAZY_LOAD_DYLIB_INFO: linkedit_data_command,
 }
 
 

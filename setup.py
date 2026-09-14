@@ -9,7 +9,7 @@ setup(
 	python_requires='>=3.8',
 	author='arandomdev',
 	url='https://github.com/arandomdev/dyldextractor',
-	install_requires=['progressbar2', 'capstone==4.0.2'],
+	install_requires=['progressbar2', 'capstone'],
 	packages=find_packages(
 		where='src'
 	),

@@ -304,12 +304,19 @@ class _LinkeditOptimizer(object):
 		for offset in range(entriesStart, entriesEnd, nlist_64.SIZE):
 			symbolEnt = nlist_64(symbolsCache.file, offset)
 			name = symbolsCache.readString(symbolStrOff + symbolEnt.n_strx)
+			indirectName = None
+			if (symbolEnt.n_type & N_TYPE) == N_INDR:
+				indirectName = symbolsCache.readString(
+					symbolStrOff + symbolEnt.n_value
+				)
 
 			# copy data
 			self.newLocalSymbolCount += 1
 			self.symbolCtx.symbolsSize += 1
 
 			symbolEnt.n_strx = self.symbolCtx.addString(name)
+			if indirectName:
+				symbolEnt.n_value = self.symbolCtx.addString(indirectName)
 			newLinkedit.extend(symbolEnt)
 
 			self.statusBar.update()
@@ -337,6 +344,11 @@ class _LinkeditOptimizer(object):
 
 			nameOff = symbolStrOff + entry.n_strx
 			name = self.linkeditFile.readString(nameOff)
+			indirectName = None
+			if (entry.n_type & N_TYPE) == N_INDR:
+				indirectName = self.linkeditFile.readString(
+					symbolStrOff + entry.n_value
+				)
 
 			# update variables and copy
 			self.oldToNewSymbolIndexes[entryIndex] = self.symbolCtx.symbolsSize
@@ -345,6 +357,8 @@ class _LinkeditOptimizer(object):
 			self.symbolCtx.symbolsSize += 1
 
 			entry.n_strx = self.symbolCtx.addString(name)
+			if indirectName:
+				entry.n_value = self.symbolCtx.addString(indirectName)
 			newLinkedit.extend(entry)
 
 			self.statusBar.update()

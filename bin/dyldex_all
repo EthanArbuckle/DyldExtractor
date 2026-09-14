@@ -137,6 +137,7 @@ def _extractImage(
 	logger.setLevel(loggingLevel)
 
 	# Process the image
+	machoCtx = None
 	with open(dyldPath, "rb") as f:
 		subCacheFiles: List[BinaryIO] = []
 		try:
@@ -199,6 +200,8 @@ def _extractImage(
 			pass
 
 		finally:
+			if machoCtx is not None:
+				machoCtx.close()
 			for file in subCacheFiles:
 				file.close()
 				pass

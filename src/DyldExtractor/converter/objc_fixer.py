@@ -443,6 +443,7 @@ class _ObjCFixer(object):
 		self._stringCache: Dict[int, int] = {}
 		self._intCache: Dict[int, int] = {}
 		self._methodNameCache: Dict[int, int] = {}
+		self._missingMethodTypeStringCount = 0
 
 		# connects a selrefs old target to its pointer address
 		self._selRefCache: Dict[int, int] = {}
@@ -458,6 +459,11 @@ class _ObjCFixer(object):
 
 		self._processSections()
 		self._finalizeFutureClasses()
+		if self._missingMethodTypeStringCount:
+			self._logger.warning(
+				f"Unable to preserve {self._missingMethodTypeStringCount} "
+				"Objective-C method type strings removed from the cache."
+			)
 
 		_ObjCSelectorFixer(self._extractionCtx, self).run()
 
@@ -1277,9 +1283,12 @@ class _ObjCFixer(object):
 				if methodDef.types:
 					typesAddr = methodAddr + 4 + methodDef.types
 					newTypesAddr = self._processString(typesAddr)
-					methodDef.types = newTypesAddr - (methodAddr + 4)
-
-					relativeFixups.append((methodOff + 4, newTypesAddr))
+					if newTypesAddr is None:
+						self._missingMethodTypeStringCount += 1
+						methodDef.types = 0
+					else:
+						methodDef.types = newTypesAddr - (methodAddr + 4)
+						relativeFixups.append((methodOff + 4, newTypesAddr))
 					pass
 
 				if noImp:
@@ -1343,7 +1352,7 @@ class _ObjCFixer(object):
 			newStringAddr = self._extraDataHead
 
 			stringOff, ctx = self._dyldCtx.convertAddr(stringAddr) or (None, None)
-			if not stringOff:
+			if stringOff is None:
 				return None
 
 			stringData = ctx.readString(stringOff)

@@ -1,4 +1,5 @@
 import struct
+import gc
 from typing import (
 	Union,
 	List,
@@ -177,6 +178,23 @@ class MachOContext(FileContext):
 		self._mappings.append((mainFileMap, self))
 		self._mappings.extend(subFilesAndMaps)
 		pass
+
+	def close(self) -> None:
+		"""Close this context and any copy-on-write subfile contexts it owns."""
+
+		contexts = {id(self): self}
+		for _, context in self._mappings:
+			contexts[id(context)] = context
+
+		mappedFiles = [context.file for context in contexts.values()]
+		# Parsed ctypes structures are zero-copy views into writable mmaps.
+		# Drop every context-owned view (and the addSubfiles self-reference)
+		# before asking mmap to release its exported buffer.
+		for context in contexts.values():
+			context.__dict__.clear()
+		gc.collect()
+		for mappedFile in mappedFiles:
+			mappedFile.close()
 
 	def ctxForAddr(self, vmaddr: int) -> "MachOContext":
 		"""Get the file context that contains the address.
