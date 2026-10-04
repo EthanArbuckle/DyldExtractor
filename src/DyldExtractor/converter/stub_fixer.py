@@ -2191,6 +2191,15 @@ class _StubFixer(object):
 			return leftName[1:] == rightName[1:]
 		return False
 
+	@staticmethod
+	def _survivesCall(disassembler, register: int) -> bool:
+		"""Return whether the AArch64 procedure-call ABI preserves a register."""
+
+		name = disassembler.reg_name(register)
+		return name.startswith("x") and name[1:].isdigit() and (
+			19 <= int(name[1:]) <= 28
+		)
+
 	def _externalSymbolPointerPages(
 		self,
 		textData: bytes,
@@ -2209,6 +2218,10 @@ class _StubFixer(object):
 		disassembler = cp.Cs(cp.CS_ARCH_ARM64, cp.CS_MODE_LITTLE_ENDIAN)
 		disassembler.detail = True
 		decoded = list(disassembler.disasm(textData, textAddress))
+		instructionIndexes = {
+			instruction.address: index
+			for index, instruction in enumerate(decoded)
+		}
 		words = {
 			textAddress + (index * 4): word[0]
 			for index, word in enumerate(struct.iter_unpack("<I", textData))
@@ -2232,15 +2245,19 @@ class _StubFixer(object):
 			base = instruction.operands[0].reg
 			slots = set()
 			safe = True
-			for consumer in decoded[index + 1:index + 33]:
-				if any(group in consumer.groups for group in (
-					cp.CS_GRP_JUMP,
-					cp.CS_GRP_CALL,
-					cp.CS_GRP_RET,
-					cp.CS_GRP_INT,
-					cp.CS_GRP_IRET,
-				)):
+			pending = [index + 1]
+			visited = set()
+			while pending:
+				consumerIndex = pending.pop()
+				if consumerIndex in visited:
+					continue
+				if consumerIndex < 0 or consumerIndex >= len(decoded):
+					continue
+				if len(visited) >= 256:
+					safe = False
 					break
+				visited.add(consumerIndex)
+				consumer = decoded[consumerIndex]
 				reads, writes = consumer.regs_access()
 				readsBase = any(
 					self._sameGeneralRegister(disassembler, register, base)
@@ -2272,7 +2289,32 @@ class _StubFixer(object):
 						break
 					slots.add(((consumerWord >> 10) & 0xFFF) * 8)
 				if writesBase:
-					break
+					continue
+				if cp.CS_GRP_CALL in consumer.groups:
+					if self._survivesCall(disassembler, base):
+						pending.append(consumerIndex + 1)
+					continue
+				if any(group in consumer.groups for group in (
+					cp.CS_GRP_RET,
+					cp.CS_GRP_INT,
+					cp.CS_GRP_IRET,
+				)):
+					continue
+				if cp.CS_GRP_JUMP in consumer.groups:
+					targets = [
+						operand.imm
+						for operand in consumer.operands
+						if operand.type == cp.CS_OP_IMM
+					]
+					pending.extend(
+						instructionIndexes[target]
+						for target in targets
+						if target in instructionIndexes
+					)
+					if consumer.mnemonic != "b":
+						pending.append(consumerIndex + 1)
+					continue
+				pending.append(consumerIndex + 1)
 			if safe and slots:
 				candidates.append((page, instruction.address, slots))
 

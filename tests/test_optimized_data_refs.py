@@ -148,6 +148,36 @@ class OptimizedDataReferenceTests(unittest.TestCase):
 				)
 				self.assertEqual(pages, {})
 
+	def test_pointer_base_is_followed_across_conditional_control_flow(self):
+		pages = self._references(
+			[
+				_adrp(0x1000, 0x8000),
+				0xB4000040,  # cbz x0, 0x100c
+				0xD503201F,
+				_ldr(9, 8, 0x18),
+				0xD65F03C0,
+			],
+			{0x8018: 0x5000},
+			{0x5000: [b"__NSConcreteStackBlock"]},
+		)
+
+		self.assertEqual(pages, {0x8000: ([0x1000], {0x18})})
+
+	def test_only_callee_saved_pointer_bases_survive_calls(self):
+		for register, expected in ((8, {}), (22, {0x8000: ([0x1000], {0x18})})):
+			with self.subTest(register=register):
+				pages = self._references(
+					[
+						_adrp(0x1000, 0x8000, register),
+						0x94000000,
+						_ldr(9, register, 0x18),
+						0xD65F03C0,
+					],
+					{0x8018: 0x5000},
+					{0x5000: [b"__NSConcreteStackBlock"]},
+				)
+				self.assertEqual(pages, expected)
+
 	def test_only_loaded_slots_are_copied_into_the_sparse_pointer_page(self):
 		source = _Bytes({
 			0x8000: b"cfstring",
