@@ -1267,7 +1267,7 @@ class _StubFixer(object):
 		self._fixStubHelpers()
 
 		stubMap = self._fixStubs(symbolPtrs)
-		self._fixOptimizedClassRefs()
+		self._fixOptimizedDataRefs()
 		self._fixCallsites(stubMap)
 		self._fixIndirectSymbols(symbolPtrs, stubMap)
 		pass
@@ -2130,8 +2130,119 @@ class _StubFixer(object):
 		linkedit.vmsize = max(linkedit.vmsize, linkedit.filesize)
 		self._machoCtx.writeBytes(linkedit._fileOff_, linkedit)
 
-	def _fixOptimizedClassRefs(self) -> None:
-		"""Localize cache-wide Objective-C class-reference pages."""
+	def _symbolTableIndexes(self) -> Dict[bytes, int]:
+		"""Return every emitted symbol-table name and its first index."""
+
+		linkeditFile = self._machoCtx.ctxForAddr(
+			self._machoCtx.segments[b"__LINKEDIT"].seg.vmaddr
+		)
+		symbolIndexes = {}
+		for index in range(self._symtab.nsyms):
+			entry = nlist_64(
+				linkeditFile.file,
+				self._symtab.symoff + (index * nlist_64.SIZE),
+			)
+			name = linkeditFile.readString(self._symtab.stroff + entry.n_strx)
+			symbolIndexes.setdefault(name, index)
+
+		return symbolIndexes
+
+	def _symbolizedPointer(
+		self,
+		slot: int,
+		symbolIndexes: Dict[bytes, int],
+	) -> Tuple[int, int]:
+		"""Return a cache pointer target and its emitted indirect-symbol index."""
+
+		if not self._dyldCtx.convertAddr(slot):
+			return None, INDIRECT_SYMBOL_ABS
+		target = self._slider.slideAddress(slot)
+		if target is None:
+			return None, INDIRECT_SYMBOL_ABS
+		names = self._symbolizer.symbolizeAddr(target) or []
+		name = next((name for name in names if name in symbolIndexes), None)
+		if name is None:
+			return target, INDIRECT_SYMBOL_ABS
+
+		return target, symbolIndexes[name]
+
+	def _externalSymbolPointerPages(
+		self,
+		instructions: List[Tuple[int]],
+		textAddress: int,
+		symbolIndexes: Dict[bytes, int],
+	) -> set:
+		"""Find external ADRP pages containing an imported pointer symbol.
+
+		The page test deliberately does not require an adjacent LDR. Optimized code
+		can retain an ADRP base across unrelated instructions or several loads; the
+		exact slid pointer target and matching emitted symbol provide the proof.
+		"""
+
+		candidatePages = set()
+		for index, (instruction,) in enumerate(instructions):
+			if (instruction & 0x9F000000) != 0x90000000:
+				continue
+			instructionAddress = textAddress + (index * 4)
+			immlo = (instruction >> 29) & 0x3
+			immhi = (instruction >> 5) & 0x7FFFF
+			pageOffset = self._arm64Utils.signExtend(
+				(immhi << 2) | immlo,
+				21,
+			) << 12
+			page = (instructionAddress & ~0xFFF) + pageOffset
+			if not self._machoCtx.containsAddr(page):
+				candidatePages.add(page)
+
+		symbolPages = set()
+		for page in candidatePages:
+			for pageOffset in range(0, 0x1000, 8):
+				_, symbolIndex = self._symbolizedPointer(
+					page + pageOffset,
+					symbolIndexes,
+				)
+				if symbolIndex != INDIRECT_SYMBOL_ABS:
+					symbolPages.add(page)
+					break
+
+		return symbolPages
+
+	def _localizedPointerPage(
+		self,
+		sourcePage: int,
+		symbolIndexes: Dict[bytes, int],
+	) -> Tuple[bytes, List[int]]:
+		"""Copy one cache page and describe every proven imported-pointer slot."""
+
+		pageData = bytearray(0x1000)
+		indirectIndexes = []
+		for pageOffset in range(0, 0x1000, 8):
+			slot = sourcePage + pageOffset
+			converted = self._dyldCtx.convertAddr(slot)
+			if converted:
+				sourceOffset, sourceFile = converted
+				pageData[pageOffset:pageOffset + 8] = sourceFile.getBytes(
+					sourceOffset,
+					8,
+				)
+
+			target, symbolIndex = self._symbolizedPointer(slot, symbolIndexes)
+			if target is not None:
+				struct.pack_into("<Q", pageData, pageOffset, target)
+			indirectIndexes.append(symbolIndex)
+
+		return bytes(pageData), indirectIndexes
+
+	def _fixOptimizedDataRefs(self) -> None:
+		"""Localize cache-wide imported-data pointer pages.
+
+		iOS 27 cache optimization can make code address shared pointer pages
+		directly. Those pages do not exist in a standalone extracted Mach-O, so
+		copy each page that has an exact exported-symbol target into ``__auth_got``
+		and retarget its ADRPs. This covers classes, Blocks ABI objects, dispatch
+		globals, exported constants, and future imported data without naming any
+		framework or symbol specially.
+		"""
 
 		textSegment = self._machoCtx.segments.get(b"__TEXT")
 		authSegment = self._machoCtx.segments.get(b"__AUTH_CONST")
@@ -2147,51 +2258,14 @@ class _StubFixer(object):
 		textData = textFile.getBytes(textOff, textSection.size)
 		textData = textData[:len(textData) & -4]
 		instructions = list(struct.iter_unpack("<I", textData))
-
-		# Find external pages used by an immediate ADRP/LDR class reference.
-		classPages = set()
-		for index in range(len(instructions) - 1):
-			adrp = instructions[index][0]
-			ldr = instructions[index + 1][0]
-			if (
-				(adrp & 0x9F000000) != 0x90000000
-				or (ldr & 0xFFC00000) != 0xF9400000
-				or ((ldr >> 5) & 0x1F) != (adrp & 0x1F)
-			):
-				continue
-
-			instructionAddr = textSection.addr + (index * 4)
-			immlo = (adrp >> 29) & 0x3
-			immhi = (adrp >> 5) & 0x7FFFF
-			pageOffset = self._arm64Utils.signExtend(
-				(immhi << 2) | immlo,
-				21,
-			) << 12
-			page = (instructionAddr & ~0xFFF) + pageOffset
-			if self._machoCtx.containsAddr(page):
-				continue
-			slot = page + (((ldr >> 10) & 0xFFF) * 8)
-			if not self._dyldCtx.convertAddr(slot):
-				continue
-			target = self._slider.slideAddress(slot)
-			names = self._symbolizer.symbolizeAddr(target) or []
-			if any(name.startswith(b"_OBJC_CLASS_$_") for name in names):
-				classPages.add(page)
-
-		if not classPages:
-			return
-
-		linkeditFile = self._machoCtx.ctxForAddr(
-			self._machoCtx.segments[b"__LINKEDIT"].seg.vmaddr
+		symbolIndexes = self._symbolTableIndexes()
+		pointerPages = self._externalSymbolPointerPages(
+			instructions,
+			textSection.addr,
+			symbolIndexes,
 		)
-		symbolIndexes = {}
-		for index in range(self._symtab.nsyms):
-			entry = nlist_64(
-				linkeditFile.file,
-				self._symtab.symoff + (index * nlist_64.SIZE),
-			)
-			name = linkeditFile.readString(self._symtab.stroff + entry.n_strx)
-			symbolIndexes.setdefault(name, index)
+		if not pointerPages:
+			return
 
 		pageStart = max(
 			authGot.addr,
@@ -2200,26 +2274,16 @@ class _StubFixer(object):
 		pageStart = (pageStart + 0xFFF) & -0x1000
 		pageMap = {
 			page: pageStart + (index * 0x1000)
-			for index, page in enumerate(sorted(classPages))
+			for index, page in enumerate(sorted(pointerPages))
 		}
 		indirectIndexes = []
 		authFile = self._machoCtx.ctxForAddr(authSegment.seg.vmaddr)
 		for sourcePage, localPage in pageMap.items():
-			pageData = bytearray(0x1000)
-			for pageOffset in range(0, 0x1000, 8):
-				slot = sourcePage + pageOffset
-				index = INDIRECT_SYMBOL_ABS
-				if self._dyldCtx.convertAddr(slot):
-					target = self._slider.slideAddress(slot)
-					names = self._symbolizer.symbolizeAddr(target) or []
-					name = next(
-						(name for name in names if name.startswith(b"_OBJC_CLASS_$_")),
-						None,
-					)
-					if name in symbolIndexes:
-						index = symbolIndexes[name]
-						struct.pack_into("<Q", pageData, pageOffset, target)
-				indirectIndexes.append(index)
+			pageData, pageIndexes = self._localizedPointerPage(
+				sourcePage,
+				symbolIndexes,
+			)
+			indirectIndexes.extend(pageIndexes)
 			localOff = self._dyldCtx.convertAddr(localPage)[0]
 			authFile.writeBytes(localOff, pageData)
 
