@@ -1939,7 +1939,7 @@ class _StubFixer(object):
 				for segment in self._machoCtx.segmentsI
 				for section in segment.sectsI
 				if section.size
-				and section.sectname in self._SYMBOL_POINTER_SECTION_NAMES
+				and section.sectname in self._SYMBOL_POINTER_SECTION_TYPES
 			]
 			stubCount = min(pointerStarts) if pointerStarts else 0
 			stubSize = authSection.reserved2 or 16
