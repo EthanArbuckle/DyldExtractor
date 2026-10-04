@@ -1227,11 +1227,11 @@ class _StubFixerError(Exception):
 
 class _StubFixer(object):
 
-	_SYMBOL_POINTER_SECTION_NAMES = {
-		b"__got",
-		b"__auth_got",
-		b"__la_symbol_ptr",
-		b"__nl_symbol_ptr",
+	_SYMBOL_POINTER_SECTION_TYPES = {
+		b"__got": S_NON_LAZY_SYMBOL_POINTERS,
+		b"__auth_got": S_NON_LAZY_SYMBOL_POINTERS,
+		b"__la_symbol_ptr": S_LAZY_SYMBOL_POINTERS,
+		b"__nl_symbol_ptr": S_NON_LAZY_SYMBOL_POINTERS,
 	}
 
 	def __init__(self, extractionCtx: ExtractionContext) -> None:
@@ -1262,6 +1262,7 @@ class _StubFixer(object):
 		if not self._dysymtab:
 			raise _StubFixerError("Unable to get dysymtab_command.")
 
+		self._normalizeSymbolPointerSections()
 		symbolPtrs = self._enumerateSymbolPointers()
 		self._fixStubHelpers()
 
@@ -1270,6 +1271,40 @@ class _StubFixer(object):
 		self._fixCallsites(stubMap)
 		self._fixIndirectSymbols(symbolPtrs, stubMap)
 		pass
+
+	def _normalizeSymbolPointerSections(self) -> None:
+		"""Restore standard section types stripped by shared-cache optimization.
+
+		Recent caches can retain canonical symbol-pointer section names and
+		``reserved1`` indirect-table indexes while clearing the section type.
+		An extracted standalone Mach-O must restore that type so ordinary Mach-O
+		consumers can associate each pointer slot with its indirect symbol.  Never
+		override a different non-regular type: a conflicting header is not enough
+		evidence to reinterpret the section.
+		"""
+
+		for segment in self._machoCtx.segmentsI:
+			for section in segment.sectsI:
+				expectedType = self._SYMBOL_POINTER_SECTION_TYPES.get(
+					section.sectname
+				)
+				if expectedType is None:
+					continue
+
+				sectionType = section.flags & SECTION_TYPE
+				if sectionType == expectedType:
+					continue
+				if sectionType != S_REGULAR:
+					self._logger.warning(
+						f"Not changing conflicting section type {hex(sectionType)} "
+						f"for {section.sectname!r}."
+					)
+					continue
+
+				section.flags = (
+					(section.flags & ~SECTION_TYPE) | expectedType
+				)
+				self._machoCtx.writeBytes(section._fileOff_, section)
 
 	def _enumerateSymbolPointers(self) -> Dict[bytes, Tuple[int]]:
 		"""Generate a mapping between a pointer's symbol and its address.
@@ -1347,7 +1382,7 @@ class _StubFixer(object):
 				if (
 					sectType == S_NON_LAZY_SYMBOL_POINTERS
 					or sectType == S_LAZY_SYMBOL_POINTERS
-					or sect.sectname in self._SYMBOL_POINTER_SECTION_NAMES
+					or sect.sectname in self._SYMBOL_POINTER_SECTION_TYPES
 				):
 					for i in range(int(sect.size / 8)):
 						self._statusBar.update(status="Caching Symbol Pointers")
@@ -2400,7 +2435,7 @@ class _StubFixer(object):
 				elif (
 					sectType == S_NON_LAZY_SYMBOL_POINTERS
 					or sectType == S_LAZY_SYMBOL_POINTERS
-					or sect.sectname in self._SYMBOL_POINTER_SECTION_NAMES
+					or sect.sectname in self._SYMBOL_POINTER_SECTION_TYPES
 				):
 					indirectStart = sect.reserved1
 					indirectEnd = sect.reserved1 + int(sect.size / 8)
