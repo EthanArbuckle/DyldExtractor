@@ -1,7 +1,15 @@
 import dataclasses
 import enum
 import struct
+import capstone as cp
 from typing import Iterator, List, Tuple, Dict
+
+from capstone.arm64 import (
+	ARM64_INS_ADRP,
+	ARM64_INS_LDR,
+	ARM64_OP_MEM,
+	ARM64_OP_REG,
+)
 
 from DyldExtractor.extraction_context import ExtractionContext
 from DyldExtractor.macho.macho_context import MachOContext
@@ -2166,57 +2174,139 @@ class _StubFixer(object):
 
 		return target, symbolIndexes[name]
 
+	@staticmethod
+	def _sameGeneralRegister(disassembler, left: int, right: int) -> bool:
+		"""Compare the architectural register behind X/W register spellings."""
+
+		leftName = disassembler.reg_name(left)
+		rightName = disassembler.reg_name(right)
+		if leftName == rightName:
+			return True
+		if (
+			len(leftName) > 1
+			and len(rightName) > 1
+			and leftName[0] in "xw"
+			and rightName[0] in "xw"
+		):
+			return leftName[1:] == rightName[1:]
+		return False
+
 	def _externalSymbolPointerPages(
 		self,
-		instructions: List[Tuple[int]],
+		textData: bytes,
 		textAddress: int,
 		symbolIndexes: Dict[bytes, int],
-	) -> set:
-		"""Find external ADRP pages containing an imported pointer symbol.
+	) -> Dict[int, Tuple[List[int], set]]:
+		"""Find proven external pointer loads grouped by source page.
 
-		The page test deliberately does not require an adjacent LDR. Optimized code
-		can retain an ADRP base across unrelated instructions or several loads; the
-		exact slid pointer target and matching emitted symbol provide the proof.
+		An external page is not itself evidence that it is a pointer table: recent
+		caches can co-locate pointer slots and structured constants.  Follow each
+		``ADRP`` within its basic block and accept it only when every use of its
+		result is a 64-bit unsigned-immediate ``LDR``.  ``ADRP + ADD`` address
+		materialization and mixed-use bases therefore remain untouched.
 		"""
 
-		candidatePages = set()
-		for index, (instruction,) in enumerate(instructions):
-			if (instruction & 0x9F000000) != 0x90000000:
+		disassembler = cp.Cs(cp.CS_ARCH_ARM64, cp.CS_MODE_LITTLE_ENDIAN)
+		disassembler.detail = True
+		decoded = list(disassembler.disasm(textData, textAddress))
+		words = {
+			textAddress + (index * 4): word[0]
+			for index, word in enumerate(struct.iter_unpack("<I", textData))
+		}
+		candidates = []
+		for index, instruction in enumerate(decoded):
+			if instruction.id != ARM64_INS_ADRP:
 				continue
-			instructionAddress = textAddress + (index * 4)
-			immlo = (instruction >> 29) & 0x3
-			immhi = (instruction >> 5) & 0x7FFFF
+			word = words[instruction.address]
+			immlo = (word >> 29) & 0x3
+			immhi = (word >> 5) & 0x7FFFF
 			pageOffset = self._arm64Utils.signExtend(
 				(immhi << 2) | immlo,
 				21,
 			) << 12
-			page = (instructionAddress & ~0xFFF) + pageOffset
-			if not self._machoCtx.containsAddr(page):
-				candidatePages.add(page)
-
-		symbolPages = set()
-		for page in candidatePages:
-			for pageOffset in range(0, 0x1000, 8):
-				_, symbolIndex = self._symbolizedPointer(
-					page + pageOffset,
-					symbolIndexes,
-				)
-				if symbolIndex != INDIRECT_SYMBOL_ABS:
-					symbolPages.add(page)
+			page = (instruction.address & ~0xFFF) + pageOffset
+			if self._machoCtx.containsAddr(page):
+				continue
+			if not instruction.operands or instruction.operands[0].type != ARM64_OP_REG:
+				continue
+			base = instruction.operands[0].reg
+			slots = set()
+			safe = True
+			for consumer in decoded[index + 1:index + 33]:
+				if any(group in consumer.groups for group in (
+					cp.CS_GRP_JUMP,
+					cp.CS_GRP_CALL,
+					cp.CS_GRP_RET,
+					cp.CS_GRP_INT,
+					cp.CS_GRP_IRET,
+				)):
 					break
+				reads, writes = consumer.regs_access()
+				readsBase = any(
+					self._sameGeneralRegister(disassembler, register, base)
+					for register in reads
+				)
+				writesBase = any(
+					self._sameGeneralRegister(disassembler, register, base)
+					for register in writes
+				)
+				if readsBase:
+					consumerWord = words[consumer.address]
+					isPointerLoad = (
+						consumer.id == ARM64_INS_LDR
+						and (consumerWord & 0xFFC00000) == 0xF9400000
+						and len(consumer.operands) >= 2
+						and consumer.operands[0].type == ARM64_OP_REG
+						and disassembler.reg_name(
+							consumer.operands[0].reg
+						).startswith("x")
+						and consumer.operands[1].type == ARM64_OP_MEM
+						and self._sameGeneralRegister(
+							disassembler,
+							consumer.operands[1].mem.base,
+							base,
+						)
+					)
+					if not isPointerLoad:
+						safe = False
+						break
+					slots.add(((consumerWord >> 10) & 0xFFF) * 8)
+				if writesBase:
+					break
+			if safe and slots:
+				candidates.append((page, instruction.address, slots))
 
-		return symbolPages
+		provenPages = {
+			page
+			for page, _, slots in candidates
+			if any(
+				self._symbolizedPointer(page + slot, symbolIndexes)[1]
+				!= INDIRECT_SYMBOL_ABS
+				for slot in slots
+			)
+		}
+		pages = {}
+		for page, address, slots in candidates:
+			if page not in provenPages:
+				continue
+			addresses, pageSlots = pages.setdefault(page, ([], set()))
+			addresses.append(address)
+			pageSlots.update(slots)
+		return pages
 
 	def _localizedPointerPage(
 		self,
 		sourcePage: int,
+		slots: set,
 		symbolIndexes: Dict[bytes, int],
 	) -> Tuple[bytes, List[int]]:
-		"""Copy one cache page and describe every proven imported-pointer slot."""
+		"""Copy only proven pointer-load slots into a sparse local GOT page."""
 
 		pageData = bytearray(0x1000)
-		indirectIndexes = []
+		indirectIndexes = [INDIRECT_SYMBOL_ABS] * (0x1000 // 8)
 		for pageOffset in range(0, 0x1000, 8):
+			if pageOffset not in slots:
+				continue
 			slot = sourcePage + pageOffset
 			converted = self._dyldCtx.convertAddr(slot)
 			if converted:
@@ -2229,7 +2319,7 @@ class _StubFixer(object):
 			target, symbolIndex = self._symbolizedPointer(slot, symbolIndexes)
 			if target is not None:
 				struct.pack_into("<Q", pageData, pageOffset, target)
-			indirectIndexes.append(symbolIndex)
+			indirectIndexes[pageOffset // 8] = symbolIndex
 
 		return bytes(pageData), indirectIndexes
 
@@ -2260,7 +2350,7 @@ class _StubFixer(object):
 		instructions = list(struct.iter_unpack("<I", textData))
 		symbolIndexes = self._symbolTableIndexes()
 		pointerPages = self._externalSymbolPointerPages(
-			instructions,
+			textData,
 			textSection.addr,
 			symbolIndexes,
 		)
@@ -2281,28 +2371,26 @@ class _StubFixer(object):
 		for sourcePage, localPage in pageMap.items():
 			pageData, pageIndexes = self._localizedPointerPage(
 				sourcePage,
+				pointerPages[sourcePage][1],
 				symbolIndexes,
 			)
 			indirectIndexes.extend(pageIndexes)
 			localOff = self._dyldCtx.convertAddr(localPage)[0]
 			authFile.writeBytes(localOff, pageData)
 
-		# Retarget every ADRP that names one of the localized pages.  Keeping
-		# page offsets stable also fixes later LDRs that reuse the same base.
+		# Retarget only ADRPs whose use chains proved pointer loads.  Keeping page
+		# offsets stable also supports one base reused by several later LDRs.
+		adrpPages = {
+			address: page
+			for page, (addresses, _) in pointerPages.items()
+			for address in addresses
+		}
 		for index, (adrp,) in enumerate(instructions):
-			if (adrp & 0x9F000000) != 0x90000000:
-				continue
 			instructionAddr = textSection.addr + (index * 4)
-			immlo = (adrp >> 29) & 0x3
-			immhi = (adrp >> 5) & 0x7FFFF
-			pageOffset = self._arm64Utils.signExtend(
-				(immhi << 2) | immlo,
-				21,
-			) << 12
-			sourcePage = (instructionAddr & ~0xFFF) + pageOffset
-			localPage = pageMap.get(sourcePage)
-			if localPage is None:
+			sourcePage = adrpPages.get(instructionAddr)
+			if sourcePage is None:
 				continue
+			localPage = pageMap.get(sourcePage)
 			deltaPages = (localPage - (instructionAddr & ~0xFFF)) >> 12
 			newAdrp = (
 				0x90000000
