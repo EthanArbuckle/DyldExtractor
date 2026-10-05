@@ -23,6 +23,10 @@ def _add(destination, base, offset):
 	return 0x91000000 | (offset << 10) | (base << 5) | destination
 
 
+def _bl(instructionAddress, target):
+	return 0x94000000 | (((target - instructionAddress) >> 2) & 0x3FFFFFF)
+
+
 def _words(*instructions):
 	return b"".join(struct.pack("<I", instruction) for instruction in instructions)
 
@@ -76,12 +80,13 @@ class OptimizedDataReferenceTests(unittest.TestCase):
 		fixer._arm64Utils = Arm64Utilities.__new__(Arm64Utilities)
 		return fixer
 
-	def _references(self, instructions, targets=None, names=None):
+	def _references(self, instructions, targets=None, names=None, functionStarts=()):
 		fixer = self._fixer(_Bytes({}), targets or {}, names or {})
 		return fixer._externalSymbolPointerPages(
 			_words(*instructions),
 			0x1000,
 			{b"__NSConcreteStackBlock": 17},
+			functionStarts,
 		)
 
 	def test_nonadjacent_and_reused_pointer_loads_are_localized(self):
@@ -177,6 +182,60 @@ class OptimizedDataReferenceTests(unittest.TestCase):
 					{0x5000: [b"__NSConcreteStackBlock"]},
 				)
 				self.assertEqual(pages, expected)
+
+	def test_pointer_proof_stops_at_the_next_function_start(self):
+		pages = self._references(
+			[
+				_adrp(0x1000, 0x8000, 22),
+				_ldr(9, 22, 0x18),
+				0x94000000,
+				0xAA1603E0,  # mov x0, x22 in the next function
+				0xD65F03C0,
+			],
+			{0x8018: 0x5000},
+			{0x5000: [b"__NSConcreteStackBlock"]},
+			(0x1000, 0x100C),
+		)
+
+		self.assertEqual(pages, {0x8000: ([0x1000], {0x18})})
+
+	def test_long_function_is_not_rejected_by_an_instruction_budget(self):
+		instructions = [
+			_adrp(0x1000, 0x8000, 22),
+			*([0xD503201F] * 300),
+			_ldr(9, 22, 0x18),
+			0xD65F03C0,
+		]
+		pages = self._references(
+			instructions,
+			{0x8018: 0x5000},
+			{0x5000: [b"__NSConcreteStackBlock"]},
+			(0x1000,),
+		)
+
+		self.assertEqual(pages, {0x8000: ([0x1000], {0x18})})
+
+	def test_call_to_proven_nonreturning_function_ends_the_use_chain(self):
+		instructions = [
+			_adrp(0x1000, 0x8000, 22),
+			_ldr(9, 22, 0x18),
+			_bl(0x1008, 0x1020),
+			0xAA1603E0,  # mov x0, x22 on a different incoming path
+			0xD65F03C0,
+			0xD503201F,
+			0xD503201F,
+			0xD503201F,
+			_bl(0x1020, 0x2000),
+			0xD4200000,  # brk #0
+		]
+		pages = self._references(
+			instructions,
+			{0x8018: 0x5000},
+			{0x5000: [b"__NSConcreteStackBlock"]},
+			(0x1000, 0x1020),
+		)
+
+		self.assertEqual(pages, {0x8000: ([0x1000], {0x18})})
 
 	def test_only_loaded_slots_are_copied_into_the_sparse_pointer_page(self):
 		source = _Bytes({

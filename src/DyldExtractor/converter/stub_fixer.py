@@ -2,11 +2,18 @@ import dataclasses
 import enum
 import struct
 import capstone as cp
+from bisect import bisect_right
 from typing import Iterator, List, Tuple, Dict
 
 from capstone.arm64 import (
 	ARM64_INS_ADRP,
+	ARM64_INS_BRK,
+	ARM64_INS_DCPS1,
+	ARM64_INS_DCPS2,
+	ARM64_INS_DCPS3,
+	ARM64_INS_HLT,
 	ARM64_INS_LDR,
+	ARM64_INS_UDF,
 	ARM64_OP_MEM,
 	ARM64_OP_REG,
 )
@@ -2200,11 +2207,32 @@ class _StubFixer(object):
 			19 <= int(name[1:]) <= 28
 		)
 
+	@staticmethod
+	def _isTerminalInstruction(instruction) -> bool:
+		"""Return whether execution cannot continue to the next instruction."""
+
+		return (
+			any(group in instruction.groups for group in (
+				cp.CS_GRP_RET,
+				cp.CS_GRP_INT,
+				cp.CS_GRP_IRET,
+			))
+			or instruction.id in (
+				ARM64_INS_BRK,
+				ARM64_INS_DCPS1,
+				ARM64_INS_DCPS2,
+				ARM64_INS_DCPS3,
+				ARM64_INS_HLT,
+				ARM64_INS_UDF,
+			)
+		)
+
 	def _externalSymbolPointerPages(
 		self,
 		textData: bytes,
 		textAddress: int,
 		symbolIndexes: Dict[bytes, int],
+		functionStarts: Tuple[int, ...] = (),
 	) -> Dict[int, Tuple[List[int], set]]:
 		"""Find proven external pointer loads grouped by source page.
 
@@ -2222,11 +2250,18 @@ class _StubFixer(object):
 			instruction.address: index
 			for index, instruction in enumerate(decoded)
 		}
+		nonReturningFunctions = self._nonReturningFunctionStarts(
+			decoded,
+			instructionIndexes,
+			functionStarts,
+			textAddress + len(textData),
+		)
 		words = {
 			textAddress + (index * 4): word[0]
 			for index, word in enumerate(struct.iter_unpack("<I", textData))
 		}
 		candidates = []
+		textEnd = textAddress + len(textData)
 		for index, instruction in enumerate(decoded):
 			if instruction.id != ARM64_INS_ADRP:
 				continue
@@ -2243,6 +2278,13 @@ class _StubFixer(object):
 			if not instruction.operands or instruction.operands[0].type != ARM64_OP_REG:
 				continue
 			base = instruction.operands[0].reg
+			functionIndex = bisect_right(functionStarts, instruction.address) - 1
+			functionEnd = (
+				functionStarts[functionIndex + 1]
+				if functionIndex >= 0 and functionIndex + 1 < len(functionStarts)
+				else textEnd
+			)
+			boundedFunction = functionIndex >= 0
 			slots = set()
 			safe = True
 			pending = [index + 1]
@@ -2253,9 +2295,11 @@ class _StubFixer(object):
 					continue
 				if consumerIndex < 0 or consumerIndex >= len(decoded):
 					continue
-				if len(visited) >= 256:
+				if not boundedFunction and len(visited) >= 256:
 					safe = False
 					break
+				if decoded[consumerIndex].address >= functionEnd:
+					continue
 				visited.add(consumerIndex)
 				consumer = decoded[consumerIndex]
 				reads, writes = consumer.regs_access()
@@ -2291,14 +2335,17 @@ class _StubFixer(object):
 				if writesBase:
 					continue
 				if cp.CS_GRP_CALL in consumer.groups:
+					targets = [
+						operand.imm
+						for operand in consumer.operands
+						if operand.type == cp.CS_OP_IMM
+					]
+					if any(target in nonReturningFunctions for target in targets):
+						continue
 					if self._survivesCall(disassembler, base):
 						pending.append(consumerIndex + 1)
 					continue
-				if any(group in consumer.groups for group in (
-					cp.CS_GRP_RET,
-					cp.CS_GRP_INT,
-					cp.CS_GRP_IRET,
-				)):
+				if self._isTerminalInstruction(consumer):
 					continue
 				if cp.CS_GRP_JUMP in consumer.groups:
 					targets = [
@@ -2306,11 +2353,15 @@ class _StubFixer(object):
 						for operand in consumer.operands
 						if operand.type == cp.CS_OP_IMM
 					]
-					pending.extend(
-						instructionIndexes[target]
-						for target in targets
-						if target in instructionIndexes
-					)
+					for target in targets:
+						if target not in instructionIndexes:
+							continue
+						if boundedFunction and target >= functionEnd:
+							safe = False
+							break
+						pending.append(instructionIndexes[target])
+					if not safe:
+						break
 					if consumer.mnemonic != "b":
 						pending.append(consumerIndex + 1)
 					continue
@@ -2335,6 +2386,94 @@ class _StubFixer(object):
 			addresses.append(address)
 			pageSlots.update(slots)
 		return pages
+
+	@staticmethod
+	def _nonReturningFunctionStarts(
+		decoded,
+		instructionIndexes: Dict[int, int],
+		functionStarts: Tuple[int, ...],
+		textEnd: int,
+	) -> set:
+		"""Prove functions that have no path returning to their caller."""
+
+		nonReturning = set()
+		for position, start in enumerate(functionStarts):
+			startIndex = instructionIndexes.get(start)
+			if startIndex is None:
+				continue
+			end = (
+				functionStarts[position + 1]
+				if position + 1 < len(functionStarts)
+				else textEnd
+			)
+			pending = [startIndex]
+			visited = set()
+			canReturn = False
+			while pending and not canReturn:
+				index = pending.pop()
+				if index in visited:
+					continue
+				if index < 0 or index >= len(decoded):
+					canReturn = True
+					break
+				instruction = decoded[index]
+				if instruction.address >= end:
+					canReturn = True
+					break
+				visited.add(index)
+				if cp.CS_GRP_RET in instruction.groups:
+					canReturn = True
+					break
+				if _StubFixer._isTerminalInstruction(instruction):
+					continue
+				if (
+					cp.CS_GRP_JUMP in instruction.groups
+					and cp.CS_GRP_CALL not in instruction.groups
+				):
+					targets = [
+						operand.imm
+						for operand in instruction.operands
+						if operand.type == cp.CS_OP_IMM
+					]
+					if not targets or any(
+						target < start or target >= end
+						for target in targets
+					):
+						canReturn = True
+						break
+					pending.extend(instructionIndexes[target] for target in targets)
+					if instruction.mnemonic != "b":
+						pending.append(index + 1)
+					continue
+				pending.append(index + 1)
+			if visited and not canReturn:
+				nonReturning.add(start)
+		return nonReturning
+
+	def _functionStarts(self, textAddress: int, textEnd: int) -> Tuple[int, ...]:
+		"""Decode ``LC_FUNCTION_STARTS`` entries that lie in ``__text``."""
+
+		command = self._machoCtx.getLoadCommand(
+			(LoadCommands.LC_FUNCTION_STARTS,),
+		)
+		linkedit = self._machoCtx.segments.get(b"__LINKEDIT")
+		text = self._machoCtx.segments.get(b"__TEXT")
+		if not command or not linkedit or not text:
+			return ()
+
+		linkeditFile = self._machoCtx.ctxForAddr(linkedit.seg.vmaddr)
+		encoded = linkeditFile.getBytes(command.dataoff, command.datasize)
+		address = text.seg.vmaddr
+		offset = 0
+		starts = []
+		while offset < len(encoded):
+			delta, offset = leb128.decodeUleb128(encoded, offset)
+			if delta == 0:
+				break
+			address += delta
+			if textAddress <= address < textEnd:
+				starts.append(address)
+		return tuple(starts)
 
 	def _localizedPointerPage(
 		self,
@@ -2395,6 +2534,10 @@ class _StubFixer(object):
 			textData,
 			textSection.addr,
 			symbolIndexes,
+			self._functionStarts(
+				textSection.addr,
+				textSection.addr + len(textData),
+			),
 		)
 		if not pointerPages:
 			return
