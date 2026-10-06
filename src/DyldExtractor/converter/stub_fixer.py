@@ -2042,6 +2042,25 @@ class _StubFixer(object):
 	) -> None:
 		"""Append synthesized N_SECT entries to the optimized linkedit."""
 
+		self._appendNamedSymbols([
+			(name, address, N_SECT, ordinal)
+			for name, address, ordinal in symbols
+		])
+
+	def _appendAbsoluteSymbols(
+		self,
+		symbols: List[Tuple[bytes, int]],
+	) -> None:
+		"""Append exact cache-external pointer-slot names as N_ABS entries."""
+
+		self._appendNamedSymbols([
+			(name, address, N_ABS, 0)
+			for name, address in symbols
+		])
+
+	def _appendNamedSymbols(self, symbols) -> None:
+		"""Append synthesized named addresses to the optimized linkedit."""
+
 		if not symbols:
 			return
 
@@ -2077,10 +2096,10 @@ class _StubFixer(object):
 		newEntries = bytearray()
 		newStrings = bytearray()
 		stringIndex = self._symtab.strsize
-		for name, address, ordinal in symbols:
+		for name, address, symbolType, ordinal in symbols:
 			entry = nlist_64()
 			entry.n_strx = stringIndex
-			entry.n_type = N_SECT
+			entry.n_type = symbolType
 			entry.n_sect = ordinal
 			entry.n_value = address
 			newEntries.extend(entry)
@@ -2100,6 +2119,26 @@ class _StubFixer(object):
 		linkedit.filesize = newEnd - linkedit.fileoff
 		linkedit.vmsize = max(linkedit.vmsize, linkedit.filesize)
 		self._machoCtx.writeBytes(linkedit._fileOff_, linkedit)
+
+	def _absoluteOptimizedPointerSymbols(
+		self,
+		pointerPages,
+		symbolIndexes,
+	) -> List[Tuple[bytes, int]]:
+		"""Exact external pointer-slot symbols proven from cache metadata."""
+
+		symbols = {}
+		for sourcePage, (_addresses, slots, _uses) in pointerPages.items():
+			for pageOffset in slots:
+				slot = sourcePage + pageOffset
+				_target, _symbolIndex, name = self._symbolizedPointerInfo(
+					slot,
+					symbolIndexes,
+				)
+				if name is not None:
+					emittedName = name if name.endswith(b"\x00") else name + b"\x00"
+					symbols[(emittedName, slot)] = None
+		return sorted(symbols)
 
 	def _appendIndirectSymbols(self, indexes: List[int]) -> None:
 		"""Append entries to the optimized indirect-symbol table."""
@@ -2679,10 +2718,20 @@ class _StubFixer(object):
 			return
 
 		if authGot.size:
-			self._logger.warning(
-				"Unable to localize remaining optimized data references: "
-				"no reusable symbol pointer exists and __auth_got is populated."
+			# A populated pointer section cannot be moved or enlarged without
+			# invalidating its existing indirect-symbol range. Preserve the cache's
+			# exact slot-to-symbol facts as standard Mach-O absolute symbols instead.
+			# The original ADRP/LDR instructions remain byte-for-byte unchanged,
+			# while standalone consumers can resolve the external pointer slots.
+			absoluteSymbols = self._absoluteOptimizedPointerSymbols(
+				pointerPages,
+				symbolIndexes,
 			)
+			self._appendAbsoluteSymbols(absoluteSymbols)
+			if not absoluteSymbols:
+				self._logger.warning(
+					"Unable to symbolize remaining optimized data references."
+				)
 			return
 
 		pageStart = max(

@@ -270,6 +270,36 @@ class OptimizedDataReferenceTests(unittest.TestCase):
 		self.assertEqual(indexes[1], 23)
 		self.assertEqual(indexes[2], INDIRECT_SYMBOL_ABS)
 
+	def test_external_pointer_slots_preserve_exact_absolute_symbol_names(self):
+		fixer = self._fixer(
+			_Bytes({}),
+			{
+				0x8018: 0x5000,
+				0x8020: 0x6000,
+				0x9028: 0x7000,
+			},
+			{
+				0x5000: [b"__NSConcreteStackBlock"],
+				0x6000: [b"_OBJC_CLASS_$_NSLock"],
+			},
+		)
+
+		symbols = fixer._absoluteOptimizedPointerSymbols(
+			{
+				0x8000: ([0x1000], {0x18, 0x20}, {}),
+				0x9000: ([0x2000], {0x28}, {}),
+			},
+			{
+				b"__NSConcreteStackBlock": 9,
+				b"_OBJC_CLASS_$_NSLock": 11,
+			},
+		)
+
+		self.assertEqual(symbols, [
+			(b"_OBJC_CLASS_$_NSLock\x00", 0x8020),
+			(b"__NSConcreteStackBlock\x00", 0x8018),
+		])
+
 	def test_aliases_choose_the_first_name_present_in_the_emitted_symbol_table(self):
 		source = _Bytes({0x8000: b"pointer!"})
 		fixer = self._fixer(
