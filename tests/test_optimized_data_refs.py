@@ -34,9 +34,13 @@ def _words(*instructions):
 class _Bytes(object):
 	def __init__(self, values):
 		self.values = values
+		self.writes = []
 
 	def getBytes(self, offset, size):
 		return self.values.get(offset, b"\x00" * size)
+
+	def writeBytes(self, offset, value):
+		self.writes.append((offset, value))
 
 
 class _Dyld(object):
@@ -82,12 +86,16 @@ class OptimizedDataReferenceTests(unittest.TestCase):
 
 	def _references(self, instructions, targets=None, names=None, functionStarts=()):
 		fixer = self._fixer(_Bytes({}), targets or {}, names or {})
-		return fixer._externalSymbolPointerPages(
+		pages = fixer._externalSymbolPointerPages(
 			_words(*instructions),
 			0x1000,
 			{b"__NSConcreteStackBlock": 17},
 			functionStarts,
 		)
+		return {
+			page: (addresses, slots)
+			for page, (addresses, slots, _uses) in pages.items()
+		}
 
 	def test_nonadjacent_and_reused_pointer_loads_are_localized(self):
 		instructions = [
@@ -277,6 +285,75 @@ class OptimizedDataReferenceTests(unittest.TestCase):
 
 		self.assertEqual(target, 0x5000)
 		self.assertEqual(index, 31)
+
+	def test_external_loads_reuse_existing_symbol_pointers_on_one_page(self):
+		text = _words(
+			_adrp(0x1000, 0x8000),
+			_ldr(9, 8, 0x18),
+			_ldr(10, 8, 0x28),
+			0xD65F03C0,
+		)
+		writer = _Bytes({})
+		fixer = self._fixer(
+			_Bytes({}),
+			{0x8018: 0x5000, 0x8028: 0x6000},
+			{0x5000: [b"_first"], 0x6000: [b"_second"]},
+		)
+		rewritten = fixer._rewriteOptimizedDataRefsToExistingPointers(
+			{
+				0x8000: (
+					[0x1000],
+					{0x18, 0x28},
+					{0x1000: {0x1004: 0x18, 0x1008: 0x28}},
+				)
+			},
+			{b"_first": [0x3008], b"_second": [0x3018]},
+			{b"_first": 3, b"_second": 4},
+			0x1000,
+			0x200,
+			writer,
+			text,
+		)
+
+		self.assertEqual(rewritten, {0x1000})
+		patched = {
+			offset: struct.unpack("<I", value)[0]
+			for offset, value in writer.writes
+		}
+		self.assertEqual(patched[0x200], _adrp(0x1000, 0x3000))
+		self.assertEqual(patched[0x204], _ldr(9, 8, 0x8))
+		self.assertEqual(patched[0x208], _ldr(10, 8, 0x18))
+
+	def test_external_load_does_not_reuse_out_of_range_symbol_pointer(self):
+		text = _words(
+			_adrp(0x1000, 0x8000),
+			_ldr(9, 8, 0x18),
+			0xD65F03C0,
+		)
+		writer = _Bytes({})
+		fixer = self._fixer(
+			_Bytes({}),
+			{0x8018: 0x5000},
+			{0x5000: [b"_first"]},
+		)
+		rewritten = fixer._rewriteOptimizedDataRefsToExistingPointers(
+			{
+				0x8000: (
+					[0x1000],
+					{0x18},
+					{0x1000: {0x1004: 0x18}},
+				)
+			},
+			{b"_first": [0x1000000000]},
+			{b"_first": 3},
+			0x1000,
+			0x200,
+			writer,
+			text,
+		)
+
+		self.assertEqual(rewritten, set())
+		self.assertEqual(writer.writes, [])
 
 
 if __name__ == "__main__":

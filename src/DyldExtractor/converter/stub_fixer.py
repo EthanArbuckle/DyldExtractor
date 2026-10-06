@@ -1282,7 +1282,7 @@ class _StubFixer(object):
 		self._fixStubHelpers()
 
 		stubMap = self._fixStubs(symbolPtrs)
-		self._fixOptimizedDataRefs()
+		self._fixOptimizedDataRefs(symbolPtrs)
 		self._fixCallsites(stubMap)
 		self._fixIndirectSymbols(symbolPtrs, stubMap)
 		pass
@@ -2169,17 +2169,30 @@ class _StubFixer(object):
 	) -> Tuple[int, int]:
 		"""Return a cache pointer target and its emitted indirect-symbol index."""
 
+		target, symbolIndex, _name = self._symbolizedPointerInfo(
+			slot,
+			symbolIndexes,
+		)
+		return target, symbolIndex
+
+	def _symbolizedPointerInfo(
+		self,
+		slot: int,
+		symbolIndexes: Dict[bytes, int],
+	):
+		"""Return one cache pointer's target, symbol index, and exact name."""
+
 		if not self._dyldCtx.convertAddr(slot):
-			return None, INDIRECT_SYMBOL_ABS
+			return None, INDIRECT_SYMBOL_ABS, None
 		target = self._slider.slideAddress(slot)
 		if target is None:
-			return None, INDIRECT_SYMBOL_ABS
+			return None, INDIRECT_SYMBOL_ABS, None
 		names = self._symbolizer.symbolizeAddr(target) or []
 		name = next((name for name in names if name in symbolIndexes), None)
 		if name is None:
-			return target, INDIRECT_SYMBOL_ABS
+			return target, INDIRECT_SYMBOL_ABS, None
 
-		return target, symbolIndexes[name]
+		return target, symbolIndexes[name], name
 
 	@staticmethod
 	def _sameGeneralRegister(disassembler, left: int, right: int) -> bool:
@@ -2286,6 +2299,7 @@ class _StubFixer(object):
 			)
 			boundedFunction = functionIndex >= 0
 			slots = set()
+			uses = {}
 			safe = True
 			pending = [index + 1]
 			visited = set()
@@ -2331,7 +2345,9 @@ class _StubFixer(object):
 					if not isPointerLoad:
 						safe = False
 						break
-					slots.add(((consumerWord >> 10) & 0xFFF) * 8)
+					loadOffset = ((consumerWord >> 10) & 0xFFF) * 8
+					slots.add(loadOffset)
+					uses[consumer.address] = loadOffset
 				if writesBase:
 					continue
 				if cp.CS_GRP_CALL in consumer.groups:
@@ -2367,11 +2383,11 @@ class _StubFixer(object):
 					continue
 				pending.append(consumerIndex + 1)
 			if safe and slots:
-				candidates.append((page, instruction.address, slots))
+				candidates.append((page, instruction.address, slots, uses))
 
 		provenPages = {
 			page
-			for page, _, slots in candidates
+			for page, _, slots, _uses in candidates
 			if any(
 				self._symbolizedPointer(page + slot, symbolIndexes)[1]
 				!= INDIRECT_SYMBOL_ABS
@@ -2379,12 +2395,16 @@ class _StubFixer(object):
 			)
 		}
 		pages = {}
-		for page, address, slots in candidates:
+		for page, address, slots, uses in candidates:
 			if page not in provenPages:
 				continue
-			addresses, pageSlots = pages.setdefault(page, ([], set()))
+			addresses, pageSlots, pageUses = pages.setdefault(
+				page,
+				([], set(), {}),
+			)
 			addresses.append(address)
 			pageSlots.update(slots)
+			pageUses[address] = uses
 		return pages
 
 	@staticmethod
@@ -2504,7 +2524,92 @@ class _StubFixer(object):
 
 		return bytes(pageData), indirectIndexes
 
-	def _fixOptimizedDataRefs(self) -> None:
+	def _rewriteOptimizedDataRefsToExistingPointers(
+		self,
+		pointerPages,
+		symbolPointers,
+		symbolIndexes,
+		textAddress,
+		textOffset,
+		textFile,
+		textData,
+	):
+		"""Retarget external pointer loads to equivalent in-image GOT slots.
+
+		Every rewritten ADRP is proven to feed only pointer loads.  All of those
+		loads must have an exact cache symbol and an existing in-image pointer to
+		the same symbol on one common page.  This preserves ordinary Mach-O import
+		metadata and avoids synthesizing storage when the linker already emitted
+		the required slots.
+		"""
+
+		words = {
+			textAddress + index * 4: word[0]
+			for index, word in enumerate(struct.iter_unpack("<I", textData))
+		}
+		rewritten = set()
+		for sourcePage, (_addresses, _slots, usesByAdrp) in pointerPages.items():
+			for adrpAddress, uses in usesByAdrp.items():
+				pointerChoices = {}
+				commonPages = None
+				for loadAddress, sourceOffset in uses.items():
+					_target, _index, name = self._symbolizedPointerInfo(
+						sourcePage + sourceOffset,
+						symbolIndexes,
+					)
+					choices = tuple(symbolPointers.get(name, ())) if name else ()
+					pages = {
+						page
+						for address in choices
+						for page in (address & ~0xFFF,)
+						if -(1 << 20) <= (
+							(page - (adrpAddress & ~0xFFF)) >> 12
+						) < (1 << 20)
+					}
+					if not pages:
+						commonPages = set()
+						break
+					commonPages = (
+						pages if commonPages is None else commonPages & pages
+					)
+					pointerChoices[loadAddress] = choices
+				if not commonPages:
+					continue
+
+				targetPage = min(commonPages)
+				loadTargets = {
+					loadAddress: next(
+						address for address in choices
+						if address & ~0xFFF == targetPage
+					)
+					for loadAddress, choices in pointerChoices.items()
+				}
+				adrp = words[adrpAddress]
+				deltaPages = (targetPage - (adrpAddress & ~0xFFF)) >> 12
+				newAdrp = (
+					0x90000000
+					| (adrp & 0x1F)
+					| ((deltaPages & 0x3) << 29)
+					| (((deltaPages >> 2) & 0x7FFFF) << 5)
+				)
+				textFile.writeBytes(
+					textOffset + adrpAddress - textAddress,
+					struct.pack("<I", newAdrp),
+				)
+				for loadAddress, target in loadTargets.items():
+					load = words[loadAddress]
+					newLoad = (
+						(load & ~0x3FFC00)
+						| (((target - targetPage) // 8) << 10)
+					)
+					textFile.writeBytes(
+						textOffset + loadAddress - textAddress,
+						struct.pack("<I", newLoad),
+					)
+				rewritten.add(adrpAddress)
+		return rewritten
+
+	def _fixOptimizedDataRefs(self, symbolPointers) -> None:
 		"""Localize cache-wide imported-data pointer pages.
 
 		iOS 27 cache optimization can make code address shared pointer pages
@@ -2521,7 +2626,7 @@ class _StubFixer(object):
 			return
 		textSection = textSegment.sects.get(b"__text")
 		authGot = authSegment.sects.get(b"__auth_got")
-		if not textSection or not authGot or authGot.size:
+		if not textSection or not authGot:
 			return
 
 		textOff = self._dyldCtx.convertAddr(textSection.addr)[0]
@@ -2540,6 +2645,44 @@ class _StubFixer(object):
 			),
 		)
 		if not pointerPages:
+			return
+
+		rewritten = self._rewriteOptimizedDataRefsToExistingPointers(
+			pointerPages,
+			symbolPointers,
+			symbolIndexes,
+			textSection.addr,
+			textOff,
+			textFile,
+			textData,
+		)
+		remainingPages = {}
+		for page, (addresses, _slots, usesByAdrp) in pointerPages.items():
+			remainingUses = {
+				address: uses
+				for address, uses in usesByAdrp.items()
+				if address not in rewritten
+			}
+			if not remainingUses:
+				continue
+			remainingPages[page] = (
+				[address for address in addresses if address in remainingUses],
+				{
+					offset
+					for uses in remainingUses.values()
+					for offset in uses.values()
+				},
+				remainingUses,
+			)
+		pointerPages = remainingPages
+		if not pointerPages:
+			return
+
+		if authGot.size:
+			self._logger.warning(
+				"Unable to localize remaining optimized data references: "
+				"no reusable symbol pointer exists and __auth_got is populated."
+			)
 			return
 
 		pageStart = max(
@@ -2567,7 +2710,7 @@ class _StubFixer(object):
 		# offsets stable also supports one base reused by several later LDRs.
 		adrpPages = {
 			address: page
-			for page, (addresses, _) in pointerPages.items()
+			for page, (addresses, _slots, _uses) in pointerPages.items()
 			for address in addresses
 		}
 		for index, (adrp,) in enumerate(instructions):
@@ -2588,7 +2731,7 @@ class _StubFixer(object):
 		authGot.addr = pageStart
 		authGot.size = len(pageMap) * 0x1000
 		# The zero-sized original section can retain a stale reserved1 before
-		# other removed indirect ranges.  Our synthesized page table starts at
+		# other removed indirect ranges. Our synthesized page table starts at
 		# the entries appended below.
 		authGot.reserved1 = self._dysymtab.nindirectsyms
 		authGot.offset = (
